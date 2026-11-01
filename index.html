@@ -276,7 +276,8 @@ code.inline{background:#1c1c1e;border-radius:6px;padding:2px 6px;font-size:14.5p
         <svg width="22" height="22" viewBox="0 0 22 22" fill="none"><path d="M11 4.5v13M4.5 11h13" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
       </button>
       <textarea id="ta" rows="1" placeholder="Введите запрос"></textarea>
-      <button class="round send" id="send" disabled aria-label="Отправить"></button>
+      <!-- data-haptic="off": у кнопки два смысла, отклик задаётся вручную -->
+      <button class="round send" id="send" data-haptic="off" disabled aria-label="Отправить"></button>
     </div>
   </div>
 
@@ -307,6 +308,53 @@ code.inline{background:#1c1c1e;border-radius:6px;padding:2px 6px;font-size:14.5p
 </div>
 
 <script>
+const tg = window.Telegram?.WebApp;
+
+/* ===================== виброотклик ===================== */
+/* В Telegram идёт в нативный HapticFeedback (Bot API 6.1+).
+   Вне Telegram — fallback на navigator.vibrate (Android Chrome).
+   На десктопе и в iOS Safari вибрации нет физически, вызовы просто молчат. */
+const Haptic = (() => {
+  const hf = tg?.HapticFeedback;
+  const tgOK = !!(hf && typeof hf.impactOccurred === "function");
+  const vibOK = !tgOK && typeof navigator.vibrate === "function";
+  let last = 0, on = true;
+
+  /* impact-события глушим на 45 мс: Telegram игнорирует частые вызовы и ломает ритм */
+  const fire = (native, pattern, force) => {
+    if (!on) return;
+    const now = performance.now();
+    if (!force && now - last < 45) return;
+    last = now;
+    try { if (tgOK) native(); else if (vibOK) navigator.vibrate(pattern); } catch (e) {}
+  };
+
+  return {
+    get enabled(){ return on },
+    set enabled(v){ on = !!v },
+    /* короткие касания */
+    tap:    () => fire(() => hf.impactOccurred("light"),  8),
+    press:  () => fire(() => hf.impactOccurred("medium"), 16),
+    heavy:  () => fire(() => hf.impactOccurred("heavy"),  26),
+    soft:   () => fire(() => hf.impactOccurred("soft"),   6),
+    rigid:  () => fire(() => hf.impactOccurred("rigid"),  11),
+    /* смена выбора в списке */
+    select: () => fire(() => (hf.selectionChanged ? hf.selectionChanged() : hf.impactOccurred("light")), 5),
+    /* уведомления: не глушатся, чтобы не терялись после тапа */
+    ok:     () => fire(() => hf.notificationOccurred("success"), [11, 45, 22], true),
+    warn:   () => fire(() => hf.notificationOccurred("warning"), [16, 55, 16], true),
+    err:    () => fire(() => hf.notificationOccurred("error"),   [22, 55, 22, 55, 22], true)
+  };
+})();
+
+/* Общий отклик на касание любой кнопки. pointerdown, а не click:
+   отдача приходит в момент нажатия и ощущается как нативная. */
+document.addEventListener("pointerdown", e => {
+  const el = e.target.closest("button,[role=button]");
+  if (!el || el.disabled || el.dataset.haptic === "off") return;
+  Haptic.tap();
+}, true);
+
 /* ===================== мок-данные ===================== */
 const AVATAR = "data:image/svg+xml;utf8," + encodeURIComponent(
   `<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'>
@@ -514,15 +562,18 @@ function renderMD(src){
 
 function copyCode(btn){
   const code = btn.closest("pre").querySelector("code").textContent;
-  const done = () => { btn.textContent = "Скопировано"; setTimeout(() => (btn.textContent = "Копировать"), 1600); };
-  if (navigator.clipboard?.writeText) navigator.clipboard.writeText(code).then(done).catch(() => toast("Буфер недоступен"));
-  else toast("Буфер недоступен в этом окружении");
+  const done = () => {
+    Haptic.ok();
+    btn.textContent = "Скопировано";
+    setTimeout(() => (btn.textContent = "Копировать"), 1600);
+  };
+  const fail = () => { Haptic.err(); toast("Буфер недоступен в этом окружении"); };
+  if (navigator.clipboard?.writeText) navigator.clipboard.writeText(code).then(done).catch(fail);
+  else fail();
 }
 
 /* ===================== утилиты ===================== */
 const $ = id => document.getElementById(id);
-const tg = window.Telegram?.WebApp;
-const haptic = (s = "light") => tg?.HapticFeedback?.impactOccurred?.(s);
 const model = () => state.models.find(m => m.path === state.modelPath) || state.models[0];
 const chat = () => state.chats.find(c => c.id === state.chatId) || null;
 const locked = m => m.pro && state.user.plan !== "pro";
@@ -596,25 +647,28 @@ function renderChat(force){
 
 function renderChats(){
   $("chats").innerHTML = state.chats.map(c => `
-    <button class="chat-item ${c.id === state.chatId ? "active" : ""}" data-id="${c.id}">
+    <button class="chat-item ${c.id === state.chatId ? "active" : ""}" data-haptic="off" data-id="${c.id}">
       <span class="t">${esc(c.title)}</span>
       <span class="del" data-del="${c.id}">${ICON_TRASH}</span>
     </button>`).join("") || `<div class="sb-label">Пока пусто</div>`;
 
   $("chats").querySelectorAll(".chat-item").forEach(el => {
+    /* отклик на самом касании: до click, чтобы не было задержки */
+    el.addEventListener("pointerdown", e => {
+      e.target.closest("[data-del]") ? Haptic.press() : Haptic.select();
+    });
     el.onclick = e => {
       const del = e.target.closest("[data-del]");
       if (del) {
         e.stopPropagation();
-        haptic("medium");
         const id = +del.dataset.del;
         state.chats = state.chats.filter(c => c.id !== id);
         if (state.chatId === id) state.chatId = state.chats[0]?.id ?? null;
         renderChats(); renderChat(true);
+        Haptic.warn();
         toast("Чат удалён");
         return;
       }
-      haptic();
       state.chatId = +el.dataset.id;
       state.modelPath = chat().model;
       closeSidebar(); renderHeader(); renderChats(); renderChat(true);
@@ -626,32 +680,33 @@ function renderPending(){
   const box = $("pending");
   box.hidden = !state.pending.length;
   box.innerHTML = state.pending.map((a, i) => a.kind === "image"
-    ? `<div class="th"><img src="${PHOTO}" alt=""><button class="rm" data-i="${i}" aria-label="Убрать">✕</button></div>`
-    : `<div class="th"><div class="chip">${ICON_DOC}<span>${esc(a.name)}</span></div><button class="rm" data-i="${i}" aria-label="Убрать">✕</button></div>`
+    ? `<div class="th"><img src="${PHOTO}" alt=""><button class="rm" data-haptic="off" data-i="${i}" aria-label="Убрать">✕</button></div>`
+    : `<div class="th"><div class="chip">${ICON_DOC}<span>${esc(a.name)}</span></div><button class="rm" data-haptic="off" data-i="${i}" aria-label="Убрать">✕</button></div>`
   ).join("");
   box.querySelectorAll(".rm").forEach(b => b.onclick = () => {
+    Haptic.press();
     state.pending.splice(+b.dataset.i, 1); renderPending(); syncSend();
   });
 }
 
 /* ===================== sidebar ===================== */
-function openSidebar(){ state.sidebar = true; haptic(); $("sidebar").classList.add("open"); $("scrim").classList.add("show"); }
+function openSidebar(){ state.sidebar = true; $("sidebar").classList.add("open"); $("scrim").classList.add("show"); }
 function closeSidebar(){ state.sidebar = false; $("sidebar").classList.remove("open"); $("scrim").classList.remove("show"); }
 $("burger").onclick = openSidebar;
 $("close-sb").onclick = closeSidebar;
-$("scrim").onclick = closeSidebar;
+/* затемнение — не кнопка, поэтому отклик вручную */
+$("scrim").onclick = () => { Haptic.tap(); closeSidebar(); };
 
 /* ===================== листы ===================== */
 function closeSheet(){ $("layer").innerHTML = ""; $("pill").classList.remove("open"); }
 
 function modelSheet(){
-  haptic();
   $("pill").classList.add("open");
   const rows = state.models.map(m => {
     const lk = locked(m);
     const sub = (m.mult === 0 ? "бесплатно" : "×" + m.mult + " энергии") + (m.vision ? " · видит картинки" : "");
     const right = lk ? `<span class="tag">PRO</span>` : (m.path === state.modelPath ? ICON_CHECK : "");
-    return `<button class="m-row ${m.path === state.modelPath ? "sel" : ""} ${lk ? "locked" : ""}" data-p="${m.path}">
+    return `<button class="m-row ${m.path === state.modelPath ? "sel" : ""} ${lk ? "locked" : ""}" data-haptic="off" data-p="${m.path}">
       <div class="meta"><div class="nm">${esc(m.name)}</div><div class="sub">${sub}</div></div>${right}</button>`;
   }).join("");
 
@@ -661,24 +716,29 @@ function modelSheet(){
       <div class="demo"><button data-toggle>демо: переключить на ${state.user.plan === "pro" ? "Free" : "Pro"}</button></div>
     </div></div>`;
 
-  $("layer").querySelector("[data-close]").onclick = closeSheet;
+  $("layer").querySelector("[data-close]").onclick = () => { Haptic.tap(); closeSheet(); };
   $("layer").querySelector("[data-toggle]").onclick = () => {
     state.user.plan = state.user.plan === "pro" ? "free" : "pro";
     state.user.energyMax = state.user.plan === "pro" ? 1000 : 50;
     state.user.energy = state.user.plan === "pro" ? 842 : 31;
     if (locked(model())) state.modelPath = state.models.find(m => !locked(m)).path;
     renderHeader(); closeSheet(); modelSheet();
+    Haptic.ok();
     toast("Тариф: " + (state.user.plan === "pro" ? "Pro" : "Free"));
   };
-  $("layer").querySelectorAll(".m-row").forEach(el => el.onclick = () => {
-    const m = state.models.find(x => x.path === el.dataset.p);
-    if (locked(m)) { closeSheet(); paywall(); return; }
-    haptic();
-    state.modelPath = m.path;
-    if (chat()) chat().model = m.path;
-    closeSheet(); renderHeader();
-    if (!chat()?.messages.length) renderChat(true);
-    toast("Модель: " + m.name);
+  $("layer").querySelectorAll(".m-row").forEach(el => {
+    el.addEventListener("pointerdown", () => {
+      locked(state.models.find(x => x.path === el.dataset.p)) ? Haptic.err() : Haptic.select();
+    });
+    el.onclick = () => {
+      const m = state.models.find(x => x.path === el.dataset.p);
+      if (locked(m)) { closeSheet(); paywall(); return; }
+      state.modelPath = m.path;
+      if (chat()) chat().model = m.path;
+      closeSheet(); renderHeader();
+      if (!chat()?.messages.length) renderChat(true);
+      toast("Модель: " + m.name);
+    };
   });
 }
 $("pill").onclick = () => ($("layer").querySelector(".sheet") ? closeSheet() : modelSheet());
@@ -704,25 +764,24 @@ function paywall(){
         <div class="hint">Демо: промокод <b>TESTPRO</b> включает Pro. Сейчас: ${state.user.plan === "pro" ? "Pro" : "Free"} · ${state.user.energy} энергии</div>
       </div></div></div>`;
 
-  $("layer").querySelector("[data-close]").onclick = closeSheet;
+  $("layer").querySelector("[data-close]").onclick = () => { Haptic.tap(); closeSheet(); };
   $("layer").querySelector("[data-pay]").onclick = e => {
     e.currentTarget.textContent = "Создаём платёж…";
-    setTimeout(() => { closeSheet(); toast("Здесь откроется страница оплаты platega.io"); }, 900);
+    setTimeout(() => { Haptic.rigid(); closeSheet(); toast("Здесь откроется страница оплаты platega.io"); }, 900);
   };
   $("layer").querySelector("[data-promo]").onclick = () => {
     const v = $("promo").value.trim().toUpperCase();
     if (v === "TESTPRO") {
       state.user.plan = "pro"; state.user.energyMax = 1000; state.user.energy = 1000;
-      renderHeader(); closeSheet(); toast("Pro активирован на 30 дней");
-    } else toast(v ? "Промокод не найден" : "Введите промокод");
+      renderHeader(); closeSheet(); Haptic.ok(); toast("Pro активирован на 30 дней");
+    } else { Haptic.err(); toast(v ? "Промокод не найден" : "Введите промокод"); }
   };
   $("promo").oninput = e => e.target.value = e.target.value.toUpperCase();
 }
 
 /* ===================== новый чат ===================== */
 function newChat(){
-  haptic();
-  if (state.busy) finishStream(true);
+  if (state.busy) finishStream(true, true);
   const id = Math.max(0, ...state.chats.map(c => c.id)) + 1;
   state.chats.unshift({ id, title:"Новый чат", model:state.modelPath, messages:[] });
   state.chatId = id;
@@ -735,8 +794,7 @@ $("av-top").onclick = () => {};   /* по ТЗ аватар ничего не о
 
 /* ===================== вложения ===================== */
 $("attach").onclick = () => {
-  if (state.user.plan !== "pro") { paywall(); toast("Вложения доступны в Pro"); return; }
-  haptic();
+  if (state.user.plan !== "pro") { Haptic.err(); paywall(); toast("Вложения доступны в Pro"); return; }
   const n = state.pending.length;
   state.pending.push(n % 2 === 0
     ? { kind:"image", name:"photo_" + (n + 1) + ".jpg" }
@@ -762,8 +820,11 @@ function setSendMode(mode){
 $("send").onclick = () => (state.busy ? finishStream(true) : send());
 
 ta.addEventListener("input", () => {
+  const before = ta.style.height;
   ta.style.height = "auto";
   ta.style.height = Math.min(ta.scrollHeight, 132) + "px";
+  /* поле выросло на строку — лёгкая отметка, как в нативных мессенджерах */
+  if (before && before !== ta.style.height) Haptic.soft();
   syncSend();
 });
 ta.addEventListener("keydown", e => {
@@ -779,7 +840,7 @@ function pickReply(q){
 }
 
 /* стрим пишет в чат, зафиксированный на момент отправки, даже если пользователь ушёл в другой */
-function finishStream(aborted){
+function finishStream(aborted, silent){
   if (state.timer) { clearInterval(state.timer); state.timer = null; }
   const s = stream; stream = null;
   state.busy = false;
@@ -792,7 +853,8 @@ function finishStream(aborted){
     if (m.mult) state.user.energy = Math.max(0, state.user.energy - Math.max(1, Math.round(txt.length / 90 * m.mult)));
   }
   renderHeader(); renderChat(); syncSend();
-  if (!aborted) haptic("soft");
+  if (silent) return;
+  aborted ? Haptic.warn() : Haptic.ok();
 }
 
 function send(){
@@ -802,8 +864,9 @@ function send(){
 
   const target = chat();
   const m = model();
-  if (m.mult > 0 && state.user.energy < 1) { paywall(); toast("Закончилась энергия"); return; }
+  if (m.mult > 0 && state.user.energy < 1) { Haptic.err(); paywall(); toast("Закончилась энергия"); return; }
 
+  Haptic.press();
   const atts = state.pending.slice();
   const fresh = target.title === "Новый чат";
   target.messages.push({ role:"user", content:text, atts });
@@ -820,7 +883,7 @@ function send(){
   toBottom(true);
 
   stream = {
-    target, wrap, i:0, modelPath:m.path, fresh,
+    target, wrap, i:0, modelPath:m.path, fresh, hinted:false,
     newTitle:(text.slice(0, 38) || (atts.length ? "Файлы и картинки" : "Новый чат")),
     full: atts.some(a => a.kind === "image") ? PHOTO_REPLY : pickReply(text)
   };
@@ -831,6 +894,8 @@ function send(){
     state.timer = setInterval(() => {
       if (stream !== s) { clearInterval(state.timer); state.timer = null; return; }
       s.i += 3 + Math.floor(Math.random() * 7);
+      /* первый токен: отметка, что модель начала отвечать */
+      if (!s.hinted) { s.hinted = true; Haptic.soft(); }
       const part = s.full.slice(0, s.i);
       const safe = (part.match(/```/g) || []).length % 2 ? part + "\n```" : part;
       s.wrap.innerHTML = `<div class="body">${renderMD(safe)}<span class="caret"></span></div>`;
